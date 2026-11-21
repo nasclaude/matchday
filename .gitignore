@@ -1,0 +1,6 @@
+/slips.json
+/report.md
+*.plain.json
+*.tmp
+node_modules/
+.DS_Store
