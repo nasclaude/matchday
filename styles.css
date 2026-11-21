@@ -370,6 +370,7 @@ button { font: inherit; color: inherit; }
 .prose th, .prose td { border-bottom: 1px solid var(--border); padding: 7px 8px; text-align: left; vertical-align: top; }
 .prose th { font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); white-space: nowrap; }
 .prose td { min-width: 3.5em; }
+.prose td:first-child { white-space: nowrap; }
 
 /* ---------- tab bar ---------- */
 .tabbar {

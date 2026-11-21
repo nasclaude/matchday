@@ -29,6 +29,7 @@ without writing anything.
 | `warnings` | string[] | no | "Before you bet" checks (line-ups, odds moving, single-source news). |
 | `avoid` | `{ "match", "reason" }[]` | no | Matches to avoid. |
 | `disclaimer` | string | no | Closing reminder. |
+| `trackRecord` | string (Markdown) | no | Output of `tools/track.py report`; shown in the app's History tab. |
 | `reportMarkdown` | string | no | Filled in automatically from `--report`. |
 
 ## Slip
@@ -60,6 +61,22 @@ without writing anything.
 | `note` | string | no | For example `"Stake refunded if City win by exactly 1"`. |
 
 Singles also take `label` (`"Safest single"`, `"Best value single"`) and `stake`.
+
+### Extra pick fields for the results log (`tools/track.py`)
+
+These let every pick be settled automatically from the final score. The app ignores them.
+
+| Field | Type | Notes |
+|---|---|---|
+| `home`, `away` | string | Team names exactly as in `match`. |
+| `matchDate` | `"YYYY-MM-DD"` | Only if the match isn't on the slips' `date`. |
+| `marketCode` | string | `1x2`, `dc`, `dnb`, `total`, `home_goals`, `away_goals`, `btts`, `win_to_nil`, `ah`, or `other` (settled by hand). |
+| `side` | string | `home`/`draw`/`away`, `1X`/`X2`/`12`, `over`/`under`, `yes`/`no`, depending on `marketCode`. |
+| `line` | number | Goal line or handicap, from that side's point of view: `2.5`, `3`, `-0.75`, `+1`. |
+| `modelPct` | number | The goals model's chance before blending. |
+| `marketPct` | number | The bookmakers' fair chance (margin removed). |
+
+Example leg: `{ "match": "Man City v Fulham", "home": "Man City", "away": "Fulham", "kickoff": "13:30", "market": "Asian handicap", "bet": "Man City -1 (Asian handicap)", "marketCode": "ah", "side": "home", "line": -1, "odds": 1.55, "winPct": 64, "modelPct": 66, "marketPct": 61, "bookmaker": "bet365", "note": "Stake refunded if City win by exactly 1" }`
 
 Calculated by `publish.mjs`: `totalOdds`, `return`, `profit`, `winChance`, `bookieChance`,
 `bookiePct` (per pick), the `system` numbers and `history`.

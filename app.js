@@ -496,8 +496,9 @@
   function viewHistory() {
     const src = state.latest || state.viewing;
     const dates = src && Array.isArray(src.history) ? src.history.filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d)) : [];
-    if (!dates.length) return el('section', { class: 'card empty' }, el('p', { text: 'No earlier reports yet.' }));
-    return el(
+    const record = src && typeof src.trackRecord === 'string' && src.trackRecord.trim() ? el('section', { class: 'card prose', html: md(src.trackRecord) }) : null;
+    if (!dates.length) return [record, el('section', { class: 'card empty' }, el('p', { text: 'No earlier reports yet.' }))];
+    return [record, el(
       'section',
       { class: 'card list' },
       el('h2', { class: 'list-title', text: 'Reports' }),
@@ -509,7 +510,7 @@
           state.latest && d === state.latest.date ? el('span', { class: 'tag', text: 'Latest' }) : icon('chevron', 'ico chev'),
         ),
       ),
-    );
+    )];
   }
 
   async function openDate(d) {
