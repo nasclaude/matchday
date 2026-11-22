@@ -7,8 +7,11 @@
  *    stored on this device only (IndexedDB, non-extractable where the browser allows it).
  *  - The agent encrypts every report with the device's PUBLIC key (ECDH + HKDF-SHA256 +
  *    AES-256-GCM) and uploads only the encrypted file (data/latest.json).
- *  - This page downloads that file from its own origin and decrypts it locally. It never
- *    talks to any other server (see the Content-Security-Policy in index.html).
+ *  - This page downloads that file from its own origin and decrypts it locally.
+ *  - The only other server it talks to is GitHub's API, and only from the Send tab: screenshots
+ *    the user picks go straight from this phone to their own PRIVATE inbox repository, using a
+ *    token the user pasted into this app (stored on this device only, encrypted at rest with a
+ *    non-extractable key). See the Content-Security-Policy in index.html.
  */
 (() => {
   const DB_NAME = 'matchday';
@@ -19,6 +22,12 @@
   const ALG = { name: 'ECDH', namedCurve: 'P-256' };
   const LATEST_URL = 'data/latest.json';
   const archiveUrl = (d) => `data/archive/${encodeURIComponent(d)}.json`;
+  const APP_VERSION = 'v4';
+  const GH_API = 'https://api.github.com';
+  const MAX_SHOTS = 10;
+  const MAX_SIDE = 2800; // longest side of an uploaded screenshot, in pixels (keeps odds legible)
+  const NOTE_MAX = 500;
+  const FINAL = new Set(['done', 'failed', 'cancelled']);
 
   const $view = document.getElementById('view');
   const $tabbar = document.getElementById('tabbar');
@@ -26,7 +35,11 @@
   const $refresh = document.getElementById('refresh');
   const $toast = document.getElementById('toast');
 
-  const state = { dev: null, latest: null, viewing: null, tab: 'slips', offline: false, error: null, lastFetch: 0 };
+  const state = {
+    dev: null, latest: null, viewing: null, tab: 'slips', offline: false, error: null, lastFetch: 0,
+    // Send tab
+    inbox: null, requests: [], compose: { files: [], note: '' }, sending: false, sendMsg: '',
+  };
 
   // ---------------------------------------------------------------- icons (static, trusted)
   const SVG = (body) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">${body}</svg>`;
@@ -39,6 +52,8 @@
     lock: SVG('<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>'),
     chevron: SVG('<path d="m9 6 6 6-6 6"/>'),
     check: SVG('<path d="m5 12.5 4.5 4.5L19 7.5"/>'),
+    send: SVG('<path d="M12 15V4"/><path d="m7.5 8.5 4.5-4.5 4.5 4.5"/><path d="M5 14v5a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-5"/>'),
+    x: SVG('<path d="M6 6l12 12M18 6 6 18"/>'),
   };
 
   // ---------------------------------------------------------------- DOM helpers
@@ -321,6 +336,7 @@
   // ---------------------------------------------------------------- views
   const TABS = [
     ['slips', 'Slips'],
+    ['send', 'Send'],
     ['report', 'Report'],
     ['history', 'History'],
     ['key', 'Key'],
@@ -351,6 +367,7 @@
     const kids = [];
     if (state.offline) kids.push(banner('You’re offline. Showing your saved copy.', 'warn'));
     if (state.tab === 'key') kids.push(viewKey());
+    else if (state.tab === 'send') kids.push(viewSend());
     else if (!p) kids.push(viewEmpty());
     else {
       if (state.error && state.error.code !== 'no-data' && !state.viewing) kids.push(banner(errText(state.error), 'warn'));
@@ -592,7 +609,7 @@
           { class: 'plain' },
           el('li', { text: 'The private key was made on this phone and never leaves it. Not even Claude has it.' }),
           el('li', { text: 'Reports are encrypted before they are uploaded. Anyone who opens the site or the GitHub repository sees only scrambled data.' }),
-          el('li', { text: 'This app doesn’t contact any other website and has no tracking.' }),
+          el('li', { text: 'The app has no tracking. Apart from this site, it only contacts GitHub, and only when you send screenshots to your private inbox.' }),
           el('li', { text: 'If you delete the app or clear its data, the key is gone. Set up again and send the new key to Claude.' }),
         ),
       ),
@@ -600,7 +617,7 @@
         'section',
         { class: 'card' },
         el('h3', { text: 'Reset' }),
-        el('p', { class: 'muted small', text: 'Makes a new key for this phone. You’ll need to send the new key to Claude, and earlier reports can’t be opened any more.' }),
+        el('p', { class: 'muted small', text: 'Makes a new key for this phone. You’ll need to send the new key to Claude, earlier reports can’t be opened any more, and you’ll need to connect your inbox again.' }),
         el('button', { class: 'btn danger block', type: 'button', onclick: resetKey }, 'Reset this phone’s key'),
       ),
     ];
@@ -614,8 +631,428 @@
       const r = indexedDB.deleteDatabase(DB_NAME);
       r.onsuccess = r.onerror = r.onblocked = () => res();
     });
-    Object.assign(state, { dev: null, latest: null, viewing: null, tab: 'slips', error: null, offline: false });
+    for (const x of state.compose.files) URL.revokeObjectURL(x.url);
+    Object.assign(state, { dev: null, latest: null, viewing: null, tab: 'slips', error: null, offline: false, inbox: null, requests: [], compose: { files: [], note: '' } });
+    stopPolling();
     renderSetup();
+  }
+
+  // ---------------------------------------------------------------- Send: screenshots to the private inbox
+  // Screenshots go straight from this phone to the user's PRIVATE GitHub repository
+  // (requests/<id>/1.jpg, 2.jpg, ..., request.json), then an issue is opened there. That issue
+  // starts the agent's task, which writes requests/<id>/status.json when it starts and finishes.
+  function b64Std(bytes) {
+    let s = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    return btoa(s);
+  }
+  function b64StdDec(str) {
+    const bin = atob(String(str).replace(/\s+/g, ''));
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+  const defaultRepo = () => {
+    const m = window.location.hostname.match(/^([a-z0-9-]+)\.github\.io$/i);
+    return m ? `${m[1]}/matchday-inbox` : '';
+  };
+
+  // The token is encrypted at rest with an AES key that can't be read out of this browser.
+  async function wrapKey() {
+    let k = await kvGet('inbox-wrap');
+    if (!k) {
+      k = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+      await kvSet('inbox-wrap', k);
+    }
+    return k;
+  }
+  async function saveInbox(repo, token) {
+    let rec;
+    try {
+      const key = await wrapKey();
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: enc.encode(repo) }, key, enc.encode(token));
+      rec = { repo, iv: b64uEnc(iv), ct: b64uEnc(ct) };
+    } catch {
+      rec = { repo, token }; // this browser can't keep keys in storage
+    }
+    await kvSet('inbox', { ...rec, saved: new Date().toISOString() });
+  }
+  async function loadInbox() {
+    const rec = await kvGet('inbox');
+    if (!rec || !rec.repo) return null;
+    if (rec.token) return { repo: rec.repo, token: rec.token };
+    const key = await kvGet('inbox-wrap');
+    if (!key) return null;
+    const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64uDec(rec.iv), additionalData: enc.encode(rec.repo) }, key, b64uDec(rec.ct));
+    return { repo: rec.repo, token: dec.decode(pt) };
+  }
+
+  async function gh(inbox, method, path, body) {
+    const headers = { Accept: 'application/vnd.github+json', Authorization: `Bearer ${inbox.token}` };
+    if (body) headers['Content-Type'] = 'application/json';
+    const res = await fetch(`${GH_API}${path}`, { method, headers, body: body ? JSON.stringify(body) : undefined, cache: 'no-store', credentials: 'omit', referrerPolicy: 'no-referrer' });
+    let data = null;
+    try { data = await res.json(); } catch { /* empty body */ }
+    if (!res.ok) {
+      const e = codeErr(`gh-${res.status}`);
+      e.status = res.status;
+      throw e;
+    }
+    return data;
+  }
+  function ghErrText(e) {
+    const code = (e && e.code) || '';
+    if (code === 'bad-repo') return 'Write the repository as owner/name, for example nasclaude/matchday-inbox.';
+    if (code === 'bad-token') return 'That doesn’t look like a GitHub token. A fine-grained token starts with github_pat_.';
+    if (code === 'public-repo') return 'That repository is public, so your screenshots would be visible to anyone. Make it private on GitHub first.';
+    if (code === 'bad-image') return 'One of the screenshots couldn’t be read. Remove it and try again.';
+    if (code === 'gh-401') return 'GitHub didn’t accept the token. It may have expired: make a new one and connect again.';
+    if (code === 'gh-403') return 'The token isn’t allowed to do that. Check that it has Contents and Issues set to read and write.';
+    if (code === 'gh-404') return 'GitHub couldn’t find that repository with this token. Check the name, and that the token includes it.';
+    if (code.startsWith('gh-')) return 'GitHub had a problem. Try again in a minute.';
+    return 'Couldn’t reach GitHub. Check your connection and try again.';
+  }
+
+  async function connectInbox(repoIn, tokenIn) {
+    const repo = String(repoIn || '').trim().replace(/^https?:\/\/github\.com\//i, '').replace(/\.git$/i, '').replace(/\/+$/, '');
+    if (!/^[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}$/.test(repo)) throw codeErr('bad-repo');
+    const token = String(tokenIn || '').trim();
+    if (!/^(github_pat_|ghp_)[A-Za-z0-9_]{20,255}$/.test(token)) throw codeErr('bad-token');
+    const info = await gh({ repo, token }, 'GET', `/repos/${repo}`);
+    if (!info || info.private !== true) throw codeErr('public-repo');
+    await saveInbox(repo, token);
+    return { repo, token };
+  }
+
+  // Re-encode as JPEG: keeps the text sharp, drops any photo metadata, keeps uploads small.
+  async function toJpeg(file) {
+    const url = URL.createObjectURL(file);
+    try {
+      const img = await new Promise((resolve, reject) => {
+        const im = new Image();
+        im.onload = () => resolve(im);
+        im.onerror = () => reject(codeErr('bad-image'));
+        im.src = url;
+      });
+      const w0 = img.naturalWidth, h0 = img.naturalHeight;
+      if (!w0 || !h0) throw codeErr('bad-image');
+      const scale = Math.min(1, MAX_SIDE / Math.max(w0, h0));
+      const w = Math.max(1, Math.round(w0 * scale)), h = Math.max(1, Math.round(h0 * scale));
+      const c = document.createElement('canvas');
+      c.width = w;
+      c.height = h;
+      const ctx = c.getContext('2d');
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, w, h);
+      ctx.drawImage(img, 0, 0, w, h);
+      const blob = await new Promise((resolve) => c.toBlob(resolve, 'image/jpeg', 0.9));
+      if (!blob) throw codeErr('bad-image');
+      return new Uint8Array(await blob.arrayBuffer());
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }
+  function newRequestId() {
+    const d = new Date();
+    const p = (n) => String(n).padStart(2, '0');
+    const rnd = Array.from(crypto.getRandomValues(new Uint8Array(4)), (b) => (b % 36).toString(36)).join('');
+    return `${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}-${p(d.getUTCHours())}${p(d.getUTCMinutes())}${p(d.getUTCSeconds())}-${rnd}`;
+  }
+
+  async function sendRequest(inbox, files, note, progress) {
+    const info = await gh(inbox, 'GET', `/repos/${inbox.repo}`);
+    if (!info || info.private !== true) throw codeErr('public-repo');
+    const id = newRequestId();
+    const base = `/repos/${inbox.repo}/contents/requests/${id}`;
+    const put = async (name, bytes, message) => {
+      const body = { message, content: b64Std(bytes) };
+      for (let attempt = 0; ; attempt++) {
+        try {
+          return await gh(inbox, 'PUT', `${base}/${name}`, body);
+        } catch (e) {
+          // 409: the branch moved under us (e.g. the agent pushed a status); try again.
+          if (attempt >= 2 || !(e.status === 409 || e.status >= 500)) throw e;
+          await new Promise((r) => setTimeout(r, 1200 * (attempt + 1)));
+        }
+      }
+    };
+    const names = [];
+    for (let i = 0; i < files.length; i++) {
+      progress(`Preparing ${i + 1} of ${files.length}…`);
+      const bytes = await toJpeg(files[i]);
+      progress(`Uploading ${i + 1} of ${files.length}…`);
+      await put(`${i + 1}.jpg`, bytes, `Add screenshot ${i + 1} of request ${id}`);
+      names.push(`${i + 1}.jpg`);
+    }
+    progress('Starting…');
+    const created = new Date().toISOString();
+    let timeZone = '';
+    try { timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch { /* ignore */ }
+    const req = { id, created, timeZone, note, screenshots: names, app: 'matchday', appVersion: APP_VERSION };
+    await put('request.json', enc.encode(`${JSON.stringify(req, null, 2)}\n`), `Add request ${id}`);
+    let issue;
+    try {
+      issue = await gh(inbox, 'POST', `/repos/${inbox.repo}/issues`, {
+        title: `Check my matches (${id})`,
+        body: `Request from the Matchday app: \`requests/${id}/\`, ${names.length} screenshot${names.length === 1 ? '' : 's'}.`,
+      });
+    } catch (e) {
+      // Without the issue nothing starts the task: mark the request so a later run skips it.
+      const cancelled = { status: 'cancelled', updatedAt: new Date().toISOString(), message: 'Not sent: the issue couldn’t be opened.' };
+      await put('status.json', enc.encode(`${JSON.stringify(cancelled)}\n`), `Cancel request ${id}`).catch(() => {});
+      throw e;
+    }
+    return { id, created, count: names.length, issue: issue && issue.number };
+  }
+
+  const saveRequests = () => kvSet('requests', state.requests.slice(0, 15)).catch(() => {});
+  const hasPending = () => state.requests.some((r) => !FINAL.has(r.status));
+  let statusBusy = false;
+  async function updateStatuses() {
+    if (!state.inbox || statusBusy || !hasPending()) return;
+    statusBusy = true;
+    let changed = false;
+    let ready = false;
+    try {
+      for (const r of state.requests.filter((x) => !FINAL.has(x.status)).slice(0, 5)) {
+        let s;
+        try {
+          const res = await gh(state.inbox, 'GET', `/repos/${state.inbox.repo}/contents/requests/${r.id}/status.json`);
+          s = JSON.parse(dec.decode(b64StdDec((res && res.content) || '')));
+        } catch (e) {
+          if (e && e.status === 404) continue; // not started yet
+          throw e;
+        }
+        if (!s || typeof s !== 'object') continue;
+        const status = ['working', 'done', 'failed', 'cancelled'].includes(s.status) ? s.status : r.status;
+        const message = typeof s.message === 'string' ? s.message.slice(0, 400) : '';
+        if (status !== r.status || message !== (r.message || '')) changed = true;
+        Object.assign(r, {
+          status,
+          message,
+          reportId: typeof s.reportId === 'string' && ID_RE.test(s.reportId) ? s.reportId : r.reportId,
+          startedAt: typeof s.startedAt === 'string' ? s.startedAt : r.startedAt,
+        });
+        if (status === 'done') ready = true;
+        if (FINAL.has(status) && r.issue && !r.closed) {
+          try {
+            await gh(state.inbox, 'PATCH', `/repos/${state.inbox.repo}/issues/${r.issue}`, { state: 'closed' });
+            r.closed = true;
+            changed = true;
+          } catch { /* best effort */ }
+        }
+      }
+    } catch { /* offline or GitHub trouble: try again later */ }
+    statusBusy = false;
+    if (changed) {
+      await saveRequests();
+      rerenderRequests();
+    }
+    if (ready) {
+      toast('Your slips are ready');
+      refresh({ quiet: true });
+    }
+    if (!hasPending()) stopPolling();
+  }
+  let pollTimer = 0;
+  function startPolling() {
+    if (pollTimer || !hasPending()) return;
+    pollTimer = setInterval(() => {
+      if (document.visibilityState === 'visible') updateStatuses();
+    }, 60000);
+  }
+  function stopPolling() {
+    clearInterval(pollTimer);
+    pollTimer = 0;
+  }
+
+  function addShots(list) {
+    const c = state.compose;
+    let skipped = 0;
+    for (const f of Array.from(list || [])) {
+      if (c.files.length >= MAX_SHOTS) { skipped++; continue; }
+      if (f.type && !/^image\//.test(f.type)) continue;
+      c.files.push({ file: f, url: URL.createObjectURL(f) });
+    }
+    if (skipped) toast(`Up to ${MAX_SHOTS} screenshots at a time`);
+    render(false);
+  }
+  function removeShot(i) {
+    const [x] = state.compose.files.splice(i, 1);
+    if (x) URL.revokeObjectURL(x.url);
+    render(false);
+  }
+  async function doSend() {
+    const c = state.compose;
+    if (!state.inbox || !c.files.length || state.sending) return;
+    state.sending = true;
+    state.sendMsg = 'Preparing…';
+    render(false);
+    const setMsg = (m) => {
+      state.sendMsg = m;
+      const b = $view.querySelector('.send-btn');
+      if (b) b.textContent = m;
+    };
+    try {
+      const r = await sendRequest(state.inbox, c.files.map((x) => x.file), c.note.trim().slice(0, NOTE_MAX), setMsg);
+      state.requests = [{ ...r, status: 'queued' }, ...state.requests].slice(0, 15);
+      await saveRequests();
+      for (const x of c.files) URL.revokeObjectURL(x.url);
+      state.compose = { files: [], note: '' };
+      toast('Sent. Claude is on it');
+      startPolling();
+    } catch (e) {
+      toast(ghErrText(e));
+    } finally {
+      state.sending = false;
+      state.sendMsg = '';
+      render(false);
+    }
+  }
+  async function disconnectInbox() {
+    if (!window.confirm('Disconnect the inbox? The token is removed from this phone. You can also revoke it on GitHub.')) return;
+    try {
+      await tx('readwrite', (s) => { s.delete('inbox'); s.delete('inbox-wrap'); });
+    } catch { /* ignore */ }
+    state.inbox = null;
+    stopPolling();
+    render(true);
+  }
+  async function openReport(id) {
+    await refresh({ quiet: true });
+    openDate(id);
+  }
+
+  const STATUS = {
+    queued: { label: 'Waiting', cls: 'wait' },
+    working: { label: 'Working', cls: 'busy' },
+    done: { label: 'Done', cls: '' },
+    failed: { label: 'Couldn’t finish', cls: 'fail' },
+    cancelled: { label: 'Not sent', cls: 'fail' },
+  };
+  const fmtShort = (iso) => {
+    const t = new Date(iso);
+    return Number.isNaN(t.getTime()) ? '' : t.toLocaleString('en-GB', { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+  };
+  function requestHint(r) {
+    if (r.message) return r.message;
+    if (r.status === 'working') return `Started ${fmtTime(r.startedAt) || 'a moment ago'}. It usually takes 15–25 minutes.`;
+    if (r.status === 'queued') {
+      return Date.now() - new Date(r.created).getTime() > 30 * 60000
+        ? 'Not started yet. Check that the task’s GitHub trigger is set up.'
+        : 'Starting in a minute or two.';
+    }
+    return '';
+  }
+  function requestsCard() {
+    if (!state.requests.length) return el('div', { class: 'req-list' });
+    return el(
+      'section',
+      { class: 'card list req-list' },
+      el('h2', { class: 'list-title', text: 'Your requests' }),
+      state.requests.slice(0, 8).map((r) => {
+        const st = STATUS[r.status] || STATUS.queued;
+        return el(
+          'div',
+          { class: 'req' },
+          el(
+            'div',
+            { class: 'req-main' },
+            el('div', { class: 'req-title', text: `${fmtShort(r.created)} · ${r.count} screenshot${r.count === 1 ? '' : 's'}` }),
+            el('div', { class: 'req-msg', text: requestHint(r) }),
+            r.status === 'done' && r.reportId ? el('button', { class: 'link', type: 'button', onclick: () => openReport(r.reportId) }, 'Open the slips') : null,
+          ),
+          el('span', { class: `tag ${st.cls}`.trim(), text: st.label }),
+        );
+      }),
+    );
+  }
+  function rerenderRequests() {
+    const old = $view.querySelector('.req-list');
+    if (old && state.tab === 'send') old.replaceWith(requestsCard());
+  }
+
+  function viewSend() {
+    if (!state.inbox) return viewConnect();
+    const c = state.compose;
+    const n = c.files.length;
+    const input = el('input', {
+      type: 'file', accept: 'image/*', multiple: true, id: 'shots', class: 'visually-hidden', disabled: state.sending,
+      onchange: (ev) => { const files = Array.from(ev.target.files || []); ev.target.value = ''; addShots(files); },
+    });
+    const note = el('textarea', { rows: 3, maxlength: NOTE_MAX, placeholder: 'Optional. For example: only these 4 matches, I like Asian handicap', disabled: state.sending });
+    note.value = c.note;
+    note.addEventListener('input', () => { c.note = note.value; });
+    return [
+      el(
+        'section',
+        { class: 'card send' },
+        el('h2', { text: 'Check your matches' }),
+        el('p', { class: 'muted small', text: 'Send screenshots of the matches and odds from your bookmaker. Claude runs the same checks as for the daily slips, on your matches only, and sends the slips here, usually in 15–25 minutes.' }),
+        n ? el('div', { class: 'thumbs' }, c.files.map((f, i) => el(
+          'div',
+          { class: 'thumb' },
+          el('img', { src: f.url, alt: `Screenshot ${i + 1}` }),
+          state.sending ? null : el('button', { class: 'thumb-x', type: 'button', 'aria-label': `Remove screenshot ${i + 1}`, html: ICONS.x, onclick: () => removeShot(i) }),
+        ))) : null,
+        input,
+        n < MAX_SHOTS && !state.sending ? el('label', { class: `btn block${n ? '' : ' primary'}`, for: 'shots' }, n ? 'Add more screenshots' : 'Choose screenshots') : null,
+        el('label', { class: 'field' }, el('span', { text: 'Note for Claude' }), note),
+        el('button', { class: 'btn primary block send-btn', type: 'button', disabled: !n || state.sending, onclick: doSend }, state.sending ? state.sendMsg || 'Sending…' : n ? `Send ${n} screenshot${n === 1 ? '' : 's'}` : 'Send'),
+        el('p', { class: 'muted small tip', text: 'Show every market you’d bet on (result, double chance, goal lines, goal goal / no goal, Asian handicap), both sides if you can. Each slip uses one pick per match, so more matches means more slips.' }),
+      ),
+      requestsCard(),
+      el(
+        'section',
+        { class: 'card' },
+        el('h3', { text: 'Inbox' }),
+        el('div', { class: 'kv' }, el('span', { text: 'Private repository' }), el('code', { text: state.inbox.repo })),
+        el('p', { class: 'muted small', text: 'Screenshots go straight from this phone to that repository. The token is stored only in this app.' }),
+        el('button', { class: 'btn block', type: 'button', onclick: disconnectInbox }, 'Disconnect'),
+      ),
+    ];
+  }
+
+  function viewConnect() {
+    const repoIn = el('input', { class: 'input', type: 'text', autocapitalize: 'off', autocomplete: 'off', autocorrect: 'off', spellcheck: 'false', placeholder: 'owner/matchday-inbox', 'aria-label': 'Repository' });
+    repoIn.value = defaultRepo();
+    const tokIn = el('input', { class: 'input', type: 'password', autocapitalize: 'off', autocomplete: 'off', autocorrect: 'off', spellcheck: 'false', placeholder: 'github_pat_…', 'aria-label': 'Token' });
+    const err = el('p', { class: 'form-err', role: 'alert', hidden: true });
+    const btn = el('button', { class: 'btn primary block', type: 'button' }, 'Connect');
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      btn.textContent = 'Checking…';
+      err.hidden = true;
+      try {
+        state.inbox = await connectInbox(repoIn.value, tokIn.value);
+        toast('Inbox connected');
+        render(true);
+      } catch (e) {
+        err.textContent = ghErrText(e);
+        err.hidden = false;
+        btn.disabled = false;
+        btn.textContent = 'Connect';
+      }
+    });
+    return el(
+      'section',
+      { class: 'card send' },
+      el('h2', { text: 'Send screenshots from here' }),
+      el('p', { class: 'muted small', text: 'Connect Matchday to your private GitHub inbox once. Your screenshots then go straight from this phone to that repository, and Claude picks them up from there.' }),
+      el(
+        'ol',
+        { class: 'plain steps' },
+        el('li', { text: 'On GitHub, create a private repository called matchday-inbox.' }),
+        el('li', {}, 'Create a fine-grained token (', el('a', { href: 'https://github.com/settings/personal-access-tokens/new', target: '_blank', rel: 'noopener noreferrer' }, 'open GitHub'), '). Repository access: only matchday-inbox. Permissions: Contents and Issues, read and write.'),
+        el('li', { text: 'Paste the token below and tap Connect.' }),
+      ),
+      el('label', { class: 'field' }, el('span', { text: 'Repository' }), repoIn),
+      el('label', { class: 'field' }, el('span', { text: 'Token' }), tokIn),
+      err,
+      btn,
+      el('p', { class: 'muted small tip', text: 'The token stays in this app on this phone and is only ever sent to GitHub. You can revoke it on GitHub at any time.' }),
+    );
   }
 
   // ---------------------------------------------------------------- setup flow
@@ -756,9 +1193,14 @@
   // ---------------------------------------------------------------- boot
   async function boot() {
     buildChrome();
-    $refresh.addEventListener('click', () => refresh());
+    $refresh.addEventListener('click', () => {
+      refresh();
+      updateStatuses();
+    });
     document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'visible' && state.dev && Date.now() - state.lastFetch > 120000) refresh({ quiet: true });
+      if (document.visibilityState !== 'visible' || !state.dev) return;
+      if (Date.now() - state.lastFetch > 120000) refresh({ quiet: true });
+      updateStatuses();
     });
     if (!window.isSecureContext || !window.crypto || !window.crypto.subtle || !window.indexedDB) {
       fatal('This page needs a secure (https) connection and an up-to-date browser.');
@@ -779,8 +1221,14 @@
       const cached = await kvGet('env:latest');
       if (cached) state.latest = await decrypt(cached, state.dev);
     } catch { /* fall through to network */ }
+    try {
+      state.inbox = await loadInbox();
+      state.requests = (await kvGet('requests')) || [];
+    } catch { /* Send tab will ask to connect again */ }
     render(false);
     refresh({ quiet: true });
+    updateStatuses();
+    startPolling();
   }
 
   boot();

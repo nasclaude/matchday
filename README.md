@@ -20,6 +20,7 @@ the phone that set up the app can open them.
 Anyone who opens the site or this repository sees only encrypted data. What *is* visible is
 that a report was published and when (from the commit history). The app loads nothing from
 other websites, has no analytics, and enforces that with a strict Content-Security-Policy.
+The only other address it may contact is GitHub's API, from the Send tab (below).
 
 ## Install on your phone
 
@@ -34,6 +35,23 @@ other websites, has no analytics, and enforces that with a strict Content-Securi
 
 If you delete the app or clear its data, the private key is gone. Set up again and replace
 `keys/phone.json` with the new key. Earlier reports can't be opened with a new key.
+
+## Send your own matches (Send tab)
+
+The Send tab lets you pick screenshots of matches and odds from your bookmaker and send them
+for research. Claude runs the same checks as for the daily slips, on those matches only, and
+the slips appear in the app as "your matches".
+
+- Screenshots go **straight from the phone to your private inbox repository** (for example
+  `nasclaude/matchday-inbox`) through GitHub's API, using a fine-grained token you paste into
+  the app once. The token can only reach that one repository (Contents and Issues: read and
+  write). It is stored only in the app on your phone, encrypted with a key that can't be read
+  out of the browser, and is only ever sent to `api.github.com`.
+- The app refuses to upload to a public repository.
+- Each request is a folder `requests/<id>/` with the screenshots (re-encoded as JPEG, which
+  also drops photo metadata) and `request.json`. The app then opens an issue, which starts the
+  research task. The task writes `requests/<id>/status.json` (`working`, then `done` or
+  `failed` with a short message), which the app shows under "Your requests".
 
 ## Files
 

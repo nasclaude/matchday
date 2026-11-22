@@ -1,7 +1,7 @@
 'use strict';
 // Offline support for the app shell. Encrypted data files (data/...) always go to the network;
 // the app keeps its own encrypted copy for offline use.
-const VERSION = 'v3';
+const VERSION = 'v4';
 const SHELL_CACHE = `matchday-shell-${VERSION}`;
 const SHELL = [
   './',
