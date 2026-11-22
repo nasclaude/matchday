@@ -259,11 +259,19 @@ async function main() {
   const keys = await loadKeys();
   if (!keys.length) fail('no device keys in keys/. The user must set up the app and add the key it shows as keys/<name>.json');
 
+  // Each report has an id: the date for the daily run, or "<date>~<run>" for an extra run
+  // (for example slips built from the user's own screenshots), so extra runs sit next to
+  // the daily report instead of replacing it.
+  const run = String(data.run || 'daily').toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 24) || 'daily';
+  data.run = run;
+  const id = run === 'daily' ? data.date : `${data.date}~${run}`;
+  data.id = id;
   const archiveDir = path.join(ROOT, 'data', 'archive');
   await mkdir(archiveDir, { recursive: true });
-  const existing = (await readdir(archiveDir)).filter((f) => /^\d{4}-\d{2}-\d{2}\.json$/.test(f)).map((f) => f.slice(0, 10));
-  const dates = [...new Set([...existing, data.date])].sort().reverse();
-  const keep = dates.slice(0, KEEP_ARCHIVE);
+  const ID_FILE = /^\d{4}-\d{2}-\d{2}(~[a-z0-9-]{1,24})?\.json$/;
+  const existing = (await readdir(archiveDir)).filter((f) => ID_FILE.test(f)).map((f) => f.slice(0, -5));
+  const ids = [...new Set([...existing, id])].sort().reverse();
+  const keep = ids.slice(0, KEEP_ARCHIVE);
   data.history = keep;
 
   for (const n of notes) console.log(`publish: ${n}`);
@@ -280,13 +288,15 @@ async function main() {
   }
 
   const envelope = JSON.stringify(await buildEnvelope(keys, data));
-  await writeAtomic(path.join(archiveDir, `${data.date}.json`), envelope);
-  const latest = keep[0] === data.date;
+  await writeAtomic(path.join(archiveDir, `${id}.json`), envelope);
+  // The newest publish becomes latest.json unless it is for an older day than another report.
+  const newestDay = keep.map((x) => x.slice(0, 10)).sort().reverse()[0];
+  const latest = data.date >= newestDay;
   if (latest) await writeAtomic(path.join(ROOT, 'data', 'latest.json'), envelope);
-  for (const d of dates.slice(KEEP_ARCHIVE)) await unlink(path.join(archiveDir, `${d}.json`)).catch(() => {});
+  for (const x of ids.slice(KEEP_ARCHIVE)) await unlink(path.join(archiveDir, `${x}.json`)).catch(() => {});
 
   console.log(`publish: encrypted for ${keys.length} device(s): ${keys.map((k) => `${k.name} (${k.kid})`).join(', ')}`);
-  console.log(`publish: wrote data/archive/${data.date}.json${latest ? ' and data/latest.json' : ' (older than latest.json, which was left unchanged)'}`);
+  console.log(`publish: wrote data/archive/${id}.json${latest ? ' and data/latest.json' : ' (older than the newest report, so latest.json was left unchanged)'}`);
 }
 
 main().catch((e) => fail(e && e.stack ? e.stack : String(e)));

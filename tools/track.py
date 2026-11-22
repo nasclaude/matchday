@@ -15,6 +15,10 @@ Commands (all take --data PATH, default ./picks.jsonl)
   report [--days N]       Markdown track record
   stats [--days N]        the same numbers as JSON
 
+Runs: slips.json may set "run" (default "daily"). Picks from another run, such as "custom-1430"
+for slips built from the user's own screenshots, get ids "<date>~<run>|<slip>|<leg>", are only
+replaced by a later add of that same run, and appear as "(your matches)" in the slip results.
+
 Pick fields read from slips.json legs and singles (see tools/SCHEMA.md):
   match, home, away, matchDate (default: the slips' date), kickoff, competition, market, bet,
   odds, bookmaker, winPct, modelPct, marketPct, and for automatic settlement:
@@ -121,10 +125,19 @@ def load(path):
 
 
 def save(path, recs):
-    recs.sort(key=lambda r: (r["date"], SLIP_ORDER.get(r["slip"], 9), r["slip"], r["leg"]))
+    recs.sort(key=lambda r: (r["date"], run_of(r) != "daily", run_of(r), SLIP_ORDER.get(r["slip"], 9), r["slip"], r["leg"]))
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text("".join(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n" for r in recs), encoding="utf-8")
     tmp.replace(path)
+
+
+def clean_run(v):
+    run = re.sub(r"[^a-z0-9-]", "", str(v or "daily").lower())[:24]
+    return run or "daily"
+
+
+def run_of(r):
+    return r.get("run") or "daily"
 
 
 def opt_float(v):
@@ -147,7 +160,7 @@ def kickoff_dt(r):
 
 
 # ------------------------------------------------------------------ commands
-def make_record(pid, day, slip, leg, i, n, warnings):
+def make_record(pid, day, run, slip, leg, i, n, warnings):
     match = str(leg.get("match") or "").strip()
     home, away = leg.get("home"), leg.get("away")
     if (not home or not away) and re.search(r"\s+vs?\.?\s+", match):
@@ -168,6 +181,7 @@ def make_record(pid, day, slip, leg, i, n, warnings):
     return {
         "id": pid,
         "date": day,
+        "run": run,
         "slip": str(slip.get("id")),
         "slipName": slip.get("name"),
         "stake": float(slip.get("stake") or 5),
@@ -201,14 +215,16 @@ def cmd_add(a):
     day = str(data.get("date") or "")
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
         raise SystemExit('track: slips.json needs "date": "YYYY-MM-DD"')
+    run = clean_run(data.get("run"))
+    prefix = day if run == "daily" else f"{day}~{run}"
     entries = []
     for s in data.get("slips") or []:
         legs = s.get("legs") or []
         for i, leg in enumerate(legs, 1):
-            entries.append((f"{day}|{s.get('id')}|{i}", s, leg, i, len(legs)))
+            entries.append((f"{prefix}|{s.get('id')}|{i}", s, leg, i, len(legs)))
     for k, x in enumerate(data.get("singles") or [], 1):
         sid = f"S{k}"
-        entries.append((f"{day}|{sid}|1", {"id": sid, "name": x.get("label") or "Single", "stake": x.get("stake") or 5}, x, 1, 1))
+        entries.append((f"{prefix}|{sid}|1", {"id": sid, "name": x.get("label") or "Single", "stake": x.get("stake") or 5}, x, 1, 1))
 
     recs = load(a.data)
     by_id = {r["id"]: r for r in recs}
@@ -220,19 +236,19 @@ def cmd_add(a):
         if old and old.get("result"):
             kept += 1
             continue
-        by_id[pid] = make_record(pid, day, slip, leg, i, n, warnings)
+        by_id[pid] = make_record(pid, day, run, slip, leg, i, n, warnings)
         if old:
             replaced += 1
         else:
             added += 1
-    # A later run for the same day replaces that day's earlier, still-open picks.
-    dropped = [pid for pid, r in by_id.items() if r["date"] == day and pid not in new_ids and not r.get("result")]
+    # A later run of the same kind for the same day replaces that run's earlier, still-open picks.
+    dropped = [pid for pid, r in by_id.items() if r["date"] == day and run_of(r) == run and pid not in new_ids and not r.get("result")]
     for pid in dropped:
         del by_id[pid]
     save(a.data, list(by_id.values()))
     for w in warnings:
         print(f"track: warning: {w}")
-    print(f"track: {added} picks added, {replaced} replaced, {len(dropped)} dropped, {kept} already settled (kept) for {day}")
+    print(f"track: {added} picks added, {replaced} replaced, {len(dropped)} dropped, {kept} already settled (kept) for {prefix}")
 
 
 def cmd_open(a):
@@ -341,14 +357,14 @@ def compute(recs, days=None):
     slips = {}
     groups = {}
     for r in recs:
-        groups.setdefault((r["date"], r["slip"]), []).append(r)
-    for (day, sid), legs in groups.items():
+        groups.setdefault((r["date"], run_of(r), r["slip"]), []).append(r)
+    for (day, run, sid), legs in groups.items():
         if any(not leg.get("result") for leg in legs):
             continue
         stake = legs[0]["stake"]
         fs = [factor(leg["result"], leg["odds"]) for leg in legs]
         ret = stake * math.prod(fs)
-        name = "Singles" if sid.startswith("S") else f"Slip {sid}"
+        name = ("Singles" if sid.startswith("S") else f"Slip {sid}") + ("" if run == "daily" else " (your matches)")
         row = slips.setdefault(name, {"settled": 0, "won": 0, "staked": 0.0, "returned": 0.0})
         row["settled"] += 1
         row["won"] += 1 if ret > stake + 1e-9 else 0

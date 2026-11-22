@@ -10,8 +10,11 @@ node tools/publish.mjs --slips /tmp/matchday/slips.json --report /tmp/matchday/r
 
 `publish.mjs` checks the file, recalculates every total, return and chance from the legs
 (any numbers you supply for those are overwritten), encrypts the result for every device key
-in `keys/`, and writes `data/latest.json` and `data/archive/<date>.json`. Commit only the
-`data/` folder. Never commit `slips.json`, `report.md` or any other plaintext.
+in `keys/`, and writes `data/archive/<id>.json` and, unless it is for an older day than
+another report, `data/latest.json`. The id is the date (`2026-11-22`), or `<date>~<run>`
+(`2026-11-22~custom-1430`) for an extra run, so extra runs sit next to the daily report in the
+app's History instead of replacing it. Commit only the `data/` folder. Never commit
+`slips.json`, `report.md` or any other plaintext.
 
 Run `node tools/publish.mjs --slips /tmp/matchday/slips.json --dry-run` first to validate
 without writing anything.
@@ -21,7 +24,8 @@ without writing anything.
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `date` | `"YYYY-MM-DD"` | yes | The matchday the slips are for (Europe/Berlin date). |
-| `title` | string | no | For example `"Saturday slips"`. |
+| `run` | string | no | `"daily"` (default) for the morning run. Any other name, for example `"custom-1430"` for slips built from the user's own screenshots at 14:30, is published and logged separately and labelled "your matches" in the app. Lower-case letters, digits and `-`, at most 24. |
+| `title` | string | no | For example `"Saturday slips"`, or `"Your matches"` for a screenshot run. |
 | `summary` | string | no | One line, for example `"14 matches analysed · odds from BetExplorer"`. |
 | `generatedAt` | ISO 8601 time | no | Defaults to now. |
 | `slips` | Slip[] | yes | In display order: A, B, C, E, D. |

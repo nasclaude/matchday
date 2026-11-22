@@ -206,6 +206,12 @@
   const todayStr = () => new Date().toLocaleDateString('en-CA');
   const fmtKid = (k) => (String(k || '').match(/.{1,4}/g) || []).join(' ');
   const tier = (p) => (Number(p) >= 75 ? 'good' : Number(p) >= 60 ? 'ok' : 'warn');
+  // Reports are identified by their date, or "<date>~<run>" for extra runs such as slips
+  // built from the user's own screenshots.
+  const ID_RE = /^\d{4}-\d{2}-\d{2}(~[a-z0-9-]{1,24})?$/;
+  const idOf = (p) => (p && (p.id || p.date)) || '';
+  const isCustom = (p) => !!(p && p.run && p.run !== 'daily');
+  const idLabel = (id) => `${fmtDayLong(id.slice(0, 10))}${id.includes('~') ? ' · your matches' : ''}`;
 
   // ---------------------------------------------------------------- safe Markdown (escapes all HTML first)
   const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
@@ -353,7 +359,7 @@
       else kids.push(viewSlips(p));
     }
     mount(kids);
-    $sub.textContent = p ? `${fmtDay(p.date)}${state.viewing ? ' · earlier report' : ''}` : '';
+    $sub.textContent = p ? `${fmtDay(p.date)}${isCustom(p) ? ' · your matches' : ''}${state.viewing ? ' · earlier report' : ''}` : '';
     updateTabs();
     if (scrollTop) window.scrollTo(0, 0);
   }
@@ -458,7 +464,7 @@
   function viewSlips(p) {
     const out = [];
     if (state.viewing) {
-      out.push(banner(`Earlier report: ${fmtDay(p.date)}`, '', el('button', { class: 'link', type: 'button', onclick: () => { state.viewing = null; render(true); } }, 'Back to latest')));
+      out.push(banner(`Earlier report: ${fmtDay(p.date)}${isCustom(p) ? ' · your matches' : ''}`, '', el('button', { class: 'link', type: 'button', onclick: () => { state.viewing = null; render(true); } }, 'Back to latest')));
     } else if (p.date && p.date < todayStr()) {
       out.push(banner(`This is the last report (${fmtDay(p.date)}). Today’s slips arrive after the morning run.`));
     }
@@ -495,7 +501,7 @@
 
   function viewHistory() {
     const src = state.latest || state.viewing;
-    const dates = src && Array.isArray(src.history) ? src.history.filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d)) : [];
+    const dates = src && Array.isArray(src.history) ? src.history.filter((d) => ID_RE.test(d)) : [];
     const record = src && typeof src.trackRecord === 'string' && src.trackRecord.trim() ? el('section', { class: 'card prose', html: md(src.trackRecord) }) : null;
     if (!dates.length) return [record, el('section', { class: 'card empty' }, el('p', { text: 'No earlier reports yet.' }))];
     return [record, el(
@@ -506,15 +512,15 @@
         el(
           'button',
           { class: 'row', type: 'button', onclick: () => openDate(d) },
-          el('span', { text: fmtDayLong(d) }),
-          state.latest && d === state.latest.date ? el('span', { class: 'tag', text: 'Latest' }) : icon('chevron', 'ico chev'),
+          el('span', { text: idLabel(d) }),
+          d === idOf(state.latest) ? el('span', { class: 'tag', text: 'Latest' }) : icon('chevron', 'ico chev'),
         ),
       ),
     )];
   }
 
   async function openDate(d) {
-    if (state.latest && d === state.latest.date) {
+    if (d === idOf(state.latest)) {
       state.viewing = null;
       state.tab = 'slips';
       render(true);
